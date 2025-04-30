@@ -1,7 +1,7 @@
 #include <WiFi.h>
 
 // WiFi credentials
-const char* ssid = "ALHN-A013";
+const char* ssid = "wifi_name";
 const char* password = "wifi_password";
 
 // Authentication credentials
