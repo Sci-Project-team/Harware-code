@@ -2,7 +2,7 @@
 
 // WiFi credentials
 const char* ssid = "ALHN-A013";
-const char* password = "0090650226";
+const char* password = "wifi_password";
 
 // Authentication credentials
 const char* username = "admin";
