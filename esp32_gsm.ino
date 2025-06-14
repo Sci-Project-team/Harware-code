@@ -2,7 +2,7 @@
 #include <PubSubClient.h>
 #include <SoftwareSerial.h>
 
-// GSM UART pins (adjust as needed)
+// GSM UART pins 
 #define GSM_RX 15
 #define GSM_TX 14
 
@@ -35,8 +35,10 @@ void sendATCommand(const char* cmd, int waitMs = 1000) {
 }
 
 void sendSMS(const char* number, const char* message) {
-  sendATCommand("AT+CMGF=1", 1000); // Set SMS to text mode
+  client.publish(logs_topic, "Sending at command AT+CMGF=1 to set text mode");
+  sendATCommand("AT+CMGF=1", 1000); 
 
+  client.publish(logs_topic, "Sending at command AT+CMGS to send the SMS");
   gsmSerial.print("AT+CMGS=\"");
   gsmSerial.print(number);
   gsmSerial.println("\"");
@@ -73,7 +75,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
   }
 
   String phone = msg.substring(toIndex + 4, pipeIndex);
-  String text = msg.substring(pipeIndex + 10);
+  String text = msg.substring(pipeIndex + 12);
 
   String log1 = "Sending SMS to " + phone;
   client.publish(logs_topic, log1.c_str());
@@ -118,5 +120,5 @@ void setup() {
 }
 
 void loop() {
-  client.loop(); // Always call this frequently
+  client.loop(); // To maintain mqtt connection consistently
 }
