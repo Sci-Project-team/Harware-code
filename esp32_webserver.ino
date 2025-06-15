@@ -3,6 +3,7 @@
 #include <SPIFFS.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include <EEPROM.h>
 
 // WiFi credentials
 const char* ssid = "realme C35";
@@ -18,9 +19,28 @@ const int mqtt_port = 1883;
 const char* send_topic = "emqx/esp32/sendmessage";
 const char* logs_topic = "logs";
 
-// File paths
+// File path
 const char* sent_messages_path = "/sent_messages.json";
 const int max_messages = 50; // Maximum number of messages to store
+
+// EEPROM settings
+#define EEPROM_SIZE 512
+#define MAX_USERS 10
+#define USERNAME_LENGTH 20
+#define PASSWORD_LENGTH 20
+
+// User structure
+struct User {
+  char username[USERNAME_LENGTH];
+  char password[PASSWORD_LENGTH];
+  bool active;
+};
+
+// Session settings
+String sessionUser = "";
+User users[MAX_USERS];
+int userCount = 0;
+
 
 // NTP Settings
 const char* ntpServer = "pool.ntp.org";
@@ -211,11 +231,126 @@ String getLogs() {
   return incomingLogs;
 }
 
+// EEPROM functions
+void loadUsersFromEEPROM() {
+  userCount = EEPROM.read(0);
+  if (userCount > MAX_USERS) userCount = 0; // Reset if corrupted
+  
+  for (int i = 0; i < userCount; i++) {
+    int baseAddr = 1 + (i * sizeof(User));
+    EEPROM.get(baseAddr, users[i]);
+  }
+}
+
+void saveUsersToEEPROM() {
+   if (userCount > MAX_USERS) return;
+  EEPROM.write(0, userCount);
+  for (int i = 0; i < userCount; i++) {
+    int baseAddr = 1 + (i * sizeof(User));
+    EEPROM.put(baseAddr, users[i]);
+  }
+  EEPROM.commit();
+}
+
+// Auth functions
+String extractAuthUser(String request) {
+  // Extract username from Basic Auth header
+  int authIndex = request.indexOf("Authorization: Basic ");
+  if (authIndex == -1) return "";
+  
+  // This is a simplified extraction - in real implementation you'd decode base64
+  // For now, we'll use form-based authentication instead
+  return "";
+}
+
+bool isValidUser(String username) {
+  return userExists(username);
+}
+
+bool addUser(String username, String password) {
+  if (userCount >= MAX_USERS) return false;
+  
+  username.toCharArray(users[userCount].username, USERNAME_LENGTH);
+  password.toCharArray(users[userCount].password, PASSWORD_LENGTH);
+  users[userCount].active = true;
+  userCount++;
+  
+  saveUsersToEEPROM();
+  return true;
+}
+
+bool userExists(String username) {
+  for (int i = 0; i < userCount; i++) {
+    if (users[i].active && String(users[i].username) == username) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool authenticateUser(String username, String password) {
+  for (int i = 0; i < userCount; i++) {
+    if (users[i].active && 
+        String(users[i].username) == username && 
+        String(users[i].password) == password) {
+      return true;
+    }
+  }
+  return false;
+}
+
+String extractFormValue(String body, String fieldName) {
+  String field = fieldName + "=";
+  int startIndex = body.indexOf(field);
+  if (startIndex == -1) {
+    Serial.println("Field '" + fieldName + "' not found in: " + body);
+    return "";
+  }
+  
+  startIndex += field.length();
+  int endIndex = body.indexOf("&", startIndex);
+  if (endIndex == -1) endIndex = body.length();
+  
+  String value = body.substring(startIndex, endIndex);
+  
+  // URL decode common characters
+  value.replace("+", " ");
+  value.replace("%20", " ");
+  value.replace("%21", "!");
+  value.replace("%40", "@");
+  value.replace("%23", "#");
+  value.replace("%24", "$");
+  value.replace("%25", "%");
+  value.replace("%5E", "^");
+  value.replace("%26", "&");
+  value.replace("%2A", "*");
+  value.replace("%28", "(");
+  value.replace("%29", ")");
+  
+  // Trim whitespace
+  value.trim();
+  
+  Serial.println("Extracting '" + fieldName + "': raw='" + body.substring(startIndex, endIndex) + "' decoded='" + value + "'");
+  return value;
+}
+
+
 void setup() {
   Serial.begin(115200);
 
   // Initialize SPIFFS
   initSPIFFS();
+
+  //Initialize EEPROM
+  EEPROM.begin(EEPROM_SIZE);
+  
+  // Load existing users from EEPROM
+  loadUsersFromEEPROM();
+  
+  // Add default admin user if no users exist
+  if (userCount == 0) {
+    addUser("admin", "password123");
+  }
 
   // Connect to Wi-Fi
   WiFi.begin(ssid, password);
@@ -255,7 +390,7 @@ void handleSendMessage(WiFiClient &webClient, String requestBody) {
   String message = getFormValue(requestBody, "message");
   
   if (phone.length() > 0 && message.length() > 0) {
-    String finalMsg = "To: " + phone + " | Message" + message;
+    String finalMsg = "To: " + phone + " | Message: " + message;
     client.publish(send_topic, finalMsg.c_str());
     client.publish(logs_topic, ("Published message: " + finalMsg).c_str());
     recordSentMessage(phone, message);
@@ -287,7 +422,182 @@ void handleGetSentMessages(WiFiClient &webClient) {
   webClient.println(messages);
 }
 
-void handleRoot(WiFiClient &webClient) {
+// --- Login Page ---
+void sendLoginPage(WiFiClient &webClient) {
+  webClient.println("HTTP/1.1 200 OK");
+  webClient.println("Content-Type: text/html");
+  webClient.println("Connection: close");
+  webClient.println();
+  webClient.println(R"rawliteral(
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Login</title>
+      <style>
+        body {
+          background-color: #f0f0f0;
+          font-family: Arial, sans-serif;
+          display: flex;
+          justify-content: center;
+          align-items: center;
+          height: 100vh;
+          margin: 0;
+        }
+        .container {
+          background: white;
+          padding: 2em;
+          border-radius: 10px;
+          box-shadow: 0 0 15px rgba(0,0,0,0.1);
+          text-align: center;
+          width: 300px;
+        }
+        input {
+          width: 100%;
+          padding: 10px;
+          margin: 10px 0;
+          border: 1px solid #ddd;
+          border-radius: 5px;
+          box-sizing: border-box;
+        }
+        button {
+          background-color: #4CAF50;
+          color: white;
+          padding: 10px 20px;
+          border: none;
+          border-radius: 5px;
+          cursor: pointer;
+          width: 100%;
+          margin: 5px 0;
+        }
+        button:hover {
+          background-color: #45a049;
+        }
+        .signup-link {
+          background-color: #008CBA;
+        }
+        .signup-link:hover {
+          background-color: #007B9A;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <h1>Login</h1>
+        <form action="/login" method="post">
+          <input type="text" name="username" placeholder="Username" required>
+          <input type="password" name="password" placeholder="Password" required>
+          <button type="submit">Login</button>
+        </form>
+        <button class="signup-link" onclick="window.location.href='/signup'">Sign Up</button>
+      </div>
+    </body>
+    </html>
+  )rawliteral");
+}
+
+void sendErrorPage(WiFiClient &webClient, String message) {
+  webClient.println("HTTP/1.1 400 Bad Request");
+  webClient.println("Content-Type: text/html");
+  webClient.println("Connection: close");
+  webClient.println();
+  webClient.println(R"rawliteral(
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Error</title>
+      <style>
+        body {
+          background-color: #fff3f3;
+          font-family: Arial, sans-serif;
+          display: flex;
+          justify-content: center;
+          align-items: center;
+          height: 100vh;
+          margin: 0;
+        }
+        .box {
+          background: white;
+          padding: 2em;
+          border: 2px solid #ff4d4d;
+          border-radius: 10px;
+          text-align: center;
+        }
+        h1 {
+          color: #ff4d4d;
+        }
+        button {
+          background-color: #008CBA;
+          color: white;
+          padding: 10px 20px;
+          border: none;
+          border-radius: 5px;
+          cursor: pointer;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="box">
+        <h1>Error</h1>
+        <p>)rawliteral" + message + R"rawliteral(</p>
+        <button onclick="history.back()">Go Back</button>
+      </div>
+    </body>
+    </html>
+  )rawliteral");
+}
+
+void sendSuccessPage(WiFiClient &webClient, String message) {
+  webClient.println("HTTP/1.1 200 OK");
+  webClient.println("Content-Type: text/html");
+  webClient.println("Connection: close");
+  webClient.println();
+  webClient.println(R"rawliteral(
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Success</title>
+      <style>
+        body {
+          background-color: #f0fff0;
+          font-family: Arial, sans-serif;
+          display: flex;
+          justify-content: center;
+          align-items: center;
+          height: 100vh;
+          margin: 0;
+        }
+        .box {
+          background: white;
+          padding: 2em;
+          border: 2px solid #4CAF50;
+          border-radius: 10px;
+          text-align: center;
+        }
+        h1 {
+          color: #4CAF50;
+        }
+        button {
+          background-color: #4CAF50;
+          color: white;
+          padding: 10px 20px;
+          border: none;
+          border-radius: 5px;
+          cursor: pointer;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="box">
+        <h1>Success!</h1>
+        <p>)rawliteral" + message + R"rawliteral(</p>
+        <button onclick="window.location.href='/login'">Login Now</button>
+      </div>
+    </body>
+    </html>
+  )rawliteral");
+}
+
+void handleWelcomePage(WiFiClient &webClient, String username) {
   webClient.println("HTTP/1.1 200 OK");
   webClient.println("Content-type:text/html");
   webClient.println("Connection: close");
@@ -311,7 +621,6 @@ void handleRoot(WiFiClient &webClient) {
         <div class="flex space-x-4">
           <a href="/" class="hover:bg-blue-700 px-3 py-2 rounded">Envoyer SMS</a>
           <a href="/sent" class="hover:bg-blue-700 px-3 py-2 rounded">Historique</a>
-          <a href="/received" class="hover:bg-blue-700 px-3 py-2 rounded">Messages Reçus</a>
           <a href="/logs" class="hover:bg-blue-700 px-3 py-2 rounded">Logs Système</a>
         </div>
       </div>
@@ -416,6 +725,18 @@ void handleRoot(WiFiClient &webClient) {
 )=====");
 }
 
+void handleLogout() {
+  sessionUser = "";
+}
+
+void handleRoot(WiFiClient &webClient) {  
+  if (!sessionUser.isEmpty()) {
+    handleWelcomePage(webClient, sessionUser);
+  } else {
+    sendLoginPage(webClient);
+  }
+}
+
 void handleSentMessagesPage(WiFiClient &webClient) {
   webClient.println("HTTP/1.1 200 OK");
   webClient.println("Content-type:text/html");
@@ -439,7 +760,6 @@ void handleSentMessagesPage(WiFiClient &webClient) {
         <div class="flex space-x-4">
           <a href="/" class="hover:bg-blue-700 px-3 py-2 rounded">Envoyer SMS</a>
           <a href="/sent" class="hover:bg-blue-700 px-3 py-2 rounded">Historique</a>
-          <a href="/received" class="hover:bg-blue-700 px-3 py-2 rounded">Messages Reçus</a>
           <a href="/logs" class="hover:bg-blue-700 px-3 py-2 rounded">Logs Système</a>
         </div>
       </div>
@@ -549,128 +869,6 @@ void handleSentMessagesPage(WiFiClient &webClient) {
 )=====");
 }
 
-void handleGetReceivedMessages(WiFiClient &webClient) {
-  webClient.println("HTTP/1.1 200 OK");
-  webClient.println("Content-Type: application/json");
-  webClient.println("Connection: close");
-  webClient.println();
-  
-  webClient.println("{\"success\": true, \"messages\": []}"); // Placeholder
-}
-
-void handleReceivedMessagesPage(WiFiClient &webClient) {
-  webClient.println("HTTP/1.1 200 OK");
-  webClient.println("Content-type:text/html");
-  webClient.println("Connection: close");
-  webClient.println();
-
-  webClient.println(R"=====(
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Messages Reçus - ESP32</title>
-  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
-</head>
-<body class="bg-gray-100">
-  <nav class="bg-blue-600 text-white shadow-lg">
-    <div class="container mx-auto px-4 py-3">
-      <div class="flex justify-between items-center">
-        <h1 class="text-xl font-bold">ESP32 SMS Gateway</h1>
-        <div class="flex space-x-4">
-          <a href="/" class="hover:bg-blue-700 px-3 py-2 rounded">Envoyer SMS</a>
-          <a href="/sent" class="hover:bg-blue-700 px-3 py-2 rounded">Historique</a>
-          <a href="/received" class="hover:bg-blue-700 px-3 py-2 rounded">Messages Reçus</a>
-          <a href="/logs" class="hover:bg-blue-700 px-3 py-2 rounded">Logs Système</a>
-        </div>
-      </div>
-    </div>
-  </nav>
-
-  <div class="container mx-auto px-4 py-8">
-    <div class="bg-white rounded-lg shadow-md p-6">
-      <div class="flex justify-between items-center mb-6">
-        <h2 class="text-2xl font-bold text-gray-800">Messages Reçus</h2>
-        <button id="refreshBtn" class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-lg">
-          Actualiser
-        </button>
-      </div>
-      
-      <div id="loading" class="text-center py-8">
-        <div class="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-500 mx-auto"></div>
-        <p class="mt-4 text-gray-600">Chargement des messages...</p>
-      </div>
-      
-      <div id="messagesContainer" class="space-y-4 hidden">
-        <!-- Messages will be inserted here by JavaScript -->
-      </div>
-      
-      <div id="noMessages" class="text-center py-8 hidden">
-        <svg class="w-12 h-12 mx-auto text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2M4 13h2m6-8v2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v2M9 7h6"></path>
-        </svg>
-        <p class="mt-4 text-gray-600">Aucun message reçu pour le moment</p>
-      </div>
-    </div>
-  </div>
-
-  <script>
-    async function fetchReceivedMessages() {
-      try {
-        document.getElementById('loading').classList.remove('hidden');
-        document.getElementById('messagesContainer').classList.add('hidden');
-        document.getElementById('noMessages').classList.add('hidden');
-        
-        const response = await fetch('/messages-received');
-        if (!response.ok) throw new Error('Network response was not ok');
-        
-        const data = await response.json();
-        
-        const container = document.getElementById('messagesContainer');
-        container.innerHTML = '';
-        
-        if (data.messages && data.messages.length > 0) {
-          data.messages.forEach(msg => {
-            const messageDiv = document.createElement('div');
-            messageDiv.className = 'bg-green-50 border border-green-200 rounded-lg p-4';
-            messageDiv.innerHTML = `
-              <div class="flex justify-between items-center mb-2">
-                <div class="font-medium text-green-700">${msg.numero}</div>
-                <div class="text-sm text-gray-500">${formatTime(msg.date)}</div>
-              </div>
-              <div class="bg-white p-3 rounded border border-gray-200">
-                ${msg.texte}
-              </div>
-            `;
-            container.appendChild(messageDiv);
-          });
-          
-          document.getElementById('messagesContainer').classList.remove('hidden');
-        } else {
-          document.getElementById('noMessages').classList.remove('hidden');
-        }
-      } catch (error) {
-        console.error('Error fetching messages:', error);
-        alert('Erreur lors du chargement des messages');
-      } finally {
-        document.getElementById('loading').classList.add('hidden');
-      }
-    }
-    
-    function formatTime(timestamp) {
-      if (!timestamp) return 'Date inconnue';
-      return timestamp;
-    }
-    
-    document.getElementById('refreshBtn').addEventListener('click', fetchReceivedMessages);
-    document.addEventListener('DOMContentLoaded', fetchReceivedMessages);
-  </script>
-</body>
-</html>
-)=====");
-}
-
 // --- Handle logs page request ---
 void handleLogsPage(WiFiClient &webClient) {
   webClient.println("HTTP/1.1 200 OK");
@@ -695,7 +893,6 @@ void handleLogsPage(WiFiClient &webClient) {
         <div class="flex space-x-4">
           <a href="/" class="hover:bg-blue-700 px-3 py-2 rounded">Envoyer SMS</a>
           <a href="/sent" class="hover:bg-blue-700 px-3 py-2 rounded">Historique</a>
-          <a href="/received" class="hover:bg-blue-700 px-3 py-2 rounded">Messages Reçus</a>
           <a href="/logs" class="hover:bg-blue-700 px-3 py-2 rounded">Logs Système</a>
         </div>
       </div>
@@ -767,6 +964,80 @@ void handleLogsPage(WiFiClient &webClient) {
 )=====");
 }
 
+// --- SignUp Page ---
+void sendSignupPage(WiFiClient &webClient) {
+  webClient.println("HTTP/1.1 200 OK");
+  webClient.println("Content-Type: text/html");
+  webClient.println("Connection: close");
+  webClient.println();
+  webClient.println(R"rawliteral(
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Sign Up</title>
+      <style>
+        body {
+          background-color: #f0f0f0;
+          font-family: Arial, sans-serif;
+          display: flex;
+          justify-content: center;
+          align-items: center;
+          height: 100vh;
+          margin: 0;
+        }
+        .container {
+          background: white;
+          padding: 2em;
+          border-radius: 10px;
+          box-shadow: 0 0 15px rgba(0,0,0,0.1);
+          text-align: center;
+          width: 300px;
+        }
+        input {
+          width: 100%;
+          padding: 10px;
+          margin: 10px 0;
+          border: 1px solid #ddd;
+          border-radius: 5px;
+          box-sizing: border-box;
+        }
+        button {
+          background-color: #4CAF50;
+          color: white;
+          padding: 10px 20px;
+          border: none;
+          border-radius: 5px;
+          cursor: pointer;
+          width: 100%;
+          margin: 5px 0;
+        }
+        button:hover {
+          background-color: #45a049;
+        }
+        .login-link {
+          background-color: #008CBA;
+        }
+        .login-link:hover {
+          background-color: #007B9A;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <h1>Sign Up</h1>
+        <form action="/signup" method="post">
+          <input type="text" name="username" placeholder="Username" required minlength="3" maxlength="19">
+          <input type="password" name="password" placeholder="Password" required minlength="6" maxlength="19">
+          <input type="password" name="confirm_password" placeholder="Confirm Password" required>
+          <button type="submit">Sign Up</button>
+        </form>
+        <button class="login-link" onclick="window.location.href='/login'">Back to Login</button>
+      </div>
+    </body>
+    </html>
+  )rawliteral");
+}
+
 // --- Handle get logs request ---
 void handleGetLogs(WiFiClient &webClient) {
   webClient.println("HTTP/1.1 200 OK");
@@ -777,74 +1048,198 @@ void handleGetLogs(WiFiClient &webClient) {
   webClient.println(getLogs());
 }
 
+// --- Handle 404 request ---
+void handle404(WiFiClient &webClient) {
+  webClient.println("HTTP/1.1 404 Not Found");
+  webClient.println("Content-Type: text/html");
+  webClient.println("Connection: close");
+  webClient.println();
+  webClient.println("<!DOCTYPE html><html><head><title>404 Not Found</title></head><body><h1>404 - Page Not Found</h1></body></html>");
+}
+
+void processSignupNew(WiFiClient &webClient, String body) {
+  String username = extractFormValue(body, "username");
+  String password = extractFormValue(body, "password");
+  String confirmPassword = extractFormValue(body, "confirm_password");
+  
+  // Debug output
+  Serial.println("=== SIGNUP DEBUG ===");
+  Serial.println("POST body: '" + body + "'");
+  Serial.println("Username: '" + username + "' (len: " + String(username.length()) + ")");
+  Serial.println("Password: '" + password + "' (len: " + String(password.length()) + ")");
+  Serial.println("==================");
+  
+  // Validate input
+  if (username.length() < 3 || password.length() < 6) {
+    sendErrorPage(webClient, "Username must be at least 3 characters and password at least 6 characters. Got: username='" + username + "' password='" + password + "'");
+    return;
+  }
+  
+  if (password != confirmPassword) {
+    sendErrorPage(webClient, "Passwords do not match.");
+    return;
+  }
+  
+  if (userExists(username)) {
+    sendErrorPage(webClient, "Username already exists.");
+    return;
+  }
+  
+  if (userCount >= MAX_USERS) {
+    sendErrorPage(webClient, "Maximum number of users reached.");
+    return;
+  }
+  
+  // Add user
+  if (addUser(username, password)) {
+    sendSuccessPage(webClient, "Account created successfully! You can now login.");
+  } else {
+    sendErrorPage(webClient, "Failed to create account.");
+  }
+}
+
+
+void handleSignupNew(WiFiClient &webClient, String request, String method, String body) {
+  if (method == "GET") {
+    sendSignupPage(webClient);
+  } else if (method == "POST") {
+    processSignupNew(webClient, body);
+  }
+}
+
+void processLoginNew(WiFiClient &webClient, String body) {
+  String username = extractFormValue(body, "username");
+  String password = extractFormValue(body, "password");
+  
+  if (authenticateUser(username, password)) {
+    sessionUser = username; 
+    handleWelcomePage(webClient, username);
+  } else {
+    sendErrorPage(webClient, "Invalid username or password.");
+  }
+}
+
+void handleLoginNew(WiFiClient &webClient, String request, String method, String body) {
+  if (method == "GET") {
+    sendLoginPage(webClient);
+  } else if (method == "POST") {
+    processLoginNew(webClient, body);
+  }
+}
+
 void loop() {
-  client.loop();  // Always keep MQTT alive
+  client.loop(); // Handle MQTT
 
   WiFiClient webClient = server.available();
-  if (webClient) {
-    header = "";
-    String requestBody = "";
-    unsigned long timeout = millis();
+  if (!webClient) return;
 
-    while (webClient.connected() && millis() - timeout < 1000) {
-      client.loop(); // keep MQTT alive
+  unsigned long timeout = millis() + 5000;
+
+  // 1. Read Request Line
+  String req = webClient.readStringUntil('\r');
+  webClient.readStringUntil('\n'); // Discard leftover newline
+  Serial.println("Request: " + req);
+
+  // Parse method and path
+  int methodEnd = req.indexOf(' ');
+  int pathEnd = req.indexOf(' ', methodEnd + 1);
+  if (methodEnd == -1 || pathEnd == -1) {
+    webClient.stop();
+    return;
+  }
+
+  String method = req.substring(0, methodEnd);
+  String path = req.substring(methodEnd + 1, pathEnd);
+  Serial.printf("[%s] %s\n", method.c_str(), path.c_str());
+
+  // Read Headers and Body (for POST)
+  String body;
+  int contentLength = 0;
+  
+  // Read headers
+  while (true) {
+    String line = webClient.readStringUntil('\r');
+    webClient.readStringUntil('\n'); // Consume the newline
+    
+    if (line.length() == 0) break; // End of headers
+    
+    Serial.println("Header: " + line);
+    
+    if (method == "POST" && line.startsWith("Content-Length:")) {
+      contentLength = line.substring(15).toInt();
+      Serial.println("Content-Length: " + String(contentLength));
+    }
+  }
+
+  // Read body if POST and content-length > 0
+  if (method == "POST" && contentLength > 0) {
+    Serial.println("Reading body...");
+    unsigned long startTime = millis();
+    
+    while (webClient.available() < contentLength && millis() - startTime < 2000) {
+      delay(10);
+    }
+    
+    for (int i = 0; i < contentLength; i++) {
       if (webClient.available()) {
-        char c = webClient.read();
-        header += c;
-
-        // Check for end of headers
-        if (header.endsWith("\r\n\r\n")) {
-          // Read POST body if it's a form submission
-          if (header.indexOf("POST /send") >= 0) {
-            while (webClient.available() == 0) {
-              client.loop();  // allow MQTT during wait
-              delay(1);
-            }
-
-            while (webClient.available()) {
-              requestBody += (char)webClient.read();
-              client.loop();  // continue MQTT
-            }
-
-            handleSendMessage(webClient, requestBody);
-          }
-
-          // Handle different routes
-          if (header.indexOf("GET / ") >= 0 || header.indexOf("GET / ") >= 0) {
-            handleRoot(webClient);
-          } 
-          else if (header.indexOf("GET /messages-sent") >= 0) {
-            handleGetSentMessages(webClient);
-          }
-          else if (header.indexOf("GET /sent") >= 0) {
-            handleSentMessagesPage(webClient);
-          }
-          else if (header.indexOf("GET /messages-received") >= 0) {
-            handleGetReceivedMessages(webClient);
-          }
-          else if (header.indexOf("GET /received") >= 0) {
-            handleReceivedMessagesPage(webClient);
-          }
-          else if (header.indexOf("GET /get-logs") >= 0) {
-            handleGetLogs(webClient);
-          }
-          else if (header.indexOf("GET /logs") >= 0) {
-            handleLogsPage(webClient);
-          }
-          else {
-            // Default response
-            webClient.println("HTTP/1.1 200 OK");
-            webClient.println("Content-type:text/html");
-            webClient.println("Connection: close");
-            webClient.println();
-            webClient.println("<!DOCTYPE html><html><body><h1>ESP32 Web Server</h1><p>Endpoint not found</p></body></html>");
-          }
-          break;
-        }
+        body += (char)webClient.read();
+      } else {
+        break;
       }
     }
-
-    delay(1);
-    webClient.stop();
+    Serial.println("Body: " + body);
   }
+
+  // Route Handling 
+  if (sessionUser.isEmpty()) {
+    // --- Unauthenticated Routes ---
+    if (path == "/") {
+      handleRoot(webClient);
+    } 
+    else if (path == "/login" && method == "GET") {
+      sendLoginPage(webClient);
+    }
+    else if (path == "/login" && method == "POST") {
+      processLoginNew(webClient, body);
+    }
+    else if (path == "/signup" && method == "GET") {
+      sendSignupPage(webClient);
+    }
+    else if (path == "/signup" && method == "POST") {
+      processSignupNew(webClient, body);
+    }
+    else {
+      handle404(webClient);
+    }
+  } 
+  else {
+    // --- Authenticated Routes ---
+    if (path == "/") {
+      handleWelcomePage(webClient, sessionUser);
+    }
+    else if (path == "/send" && method == "POST") {
+      handleSendMessage(webClient, body);
+    }
+    else if (path == "/messages-sent") {
+      handleGetSentMessages(webClient);
+    }
+    else if (path == "/sent") {
+      handleSentMessagesPage(webClient);
+    }
+    else if (path == "/get-logs") {
+      handleGetLogs(webClient);
+    }
+    else if (path == "/logs") {
+      handleLogsPage(webClient);
+    }
+    else if (path == "/logout") {
+      handleLogout();
+      sendLoginPage(webClient);
+    }
+    else {
+      handle404(webClient);
+    }
+  }
+
+  webClient.stop();
 }
